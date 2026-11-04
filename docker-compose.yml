@@ -1,0 +1,91 @@
+# Full Classroom Digital Twin stack.
+#
+# Two containers:
+#   db   - official PostgreSQL 17, data in the `twin_pgdata` volume
+#   api  - FastAPI + Uvicorn + the static frontend/ directory
+#
+# The frontend has no separate container: FastAPI serves frontend/ from the
+# same origin as /api and /ws, so there is no CORS or WebSocket proxy needed.
+#
+# Host port 5433 avoids collisions with:
+#   - PostgreSQL installed on the PC (5432)
+#
+# Start:          docker compose up -d --build
+# Status:         docker compose ps
+# Logs:           docker compose logs -f
+# Tests:          docker compose exec api python -m pytest -q
+# Stop:           docker compose down
+# Delete data:    docker compose down -v
+
+name: dt-sitee
+
+services:
+  db:
+    image: postgres:17
+    container_name: dt-sitee-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TWIN_TIMEZONE:-Africa/Casablanca}
+      PGTZ: ${TWIN_TIMEZONE:-Africa/Casablanca}
+    ports:
+      # Host 5433 -> container 5432 (inspection from pgAdmin/psql).
+      - "5433:5432"
+    volumes:
+      # Named volume: data survives `docker compose down`.
+      - twin_pgdata:/var/lib/postgresql/data
+      # SQL files run only when the volume is empty (first initialization).
+      - ./backend/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dt-sitee-api
+    container_name: dt-sitee-api
+    restart: unless-stopped
+    environment:
+      # Inside the Docker network the database host is the service name `db`,
+      # not 127.0.0.1 (each container has its own loopback).
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}_test
+      APP_NAME: Classroom Digital Twin
+      TWIN_TIMEZONE: ${TWIN_TIMEZONE:-Africa/Casablanca}
+      AUTO_INIT_DB: "true"
+      SERVE_FRONTEND: "true"
+      CORS_ORIGINS: "*"
+      # Occupancy hysteresis is configuration, not baked into the image.
+      OCCUPIED_CONFIRM_SECONDS: ${OCCUPIED_CONFIRM_SECONDS:-2}
+      EMPTY_CONFIRM_SECONDS: ${EMPTY_CONFIRM_SECONDS:-3}
+      PRESENCE_GRACE_SECONDS: "15"
+      BOUNDARY_TICK_SECONDS: "1"
+      TWIN_INGEST_TOKEN: ${TWIN_INGEST_TOKEN:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  twin_pgdata:
+    name: dt-sitee-pgdata

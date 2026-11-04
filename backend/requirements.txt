@@ -1,0 +1,12 @@
+# Classroom Digital Twin - backend dependencies
+fastapi>=0.110
+uvicorn[standard]>=0.27
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+tzdata>=2024.1
+websockets>=12
+
+# Tests
+pytest>=8
+httpx>=0.27

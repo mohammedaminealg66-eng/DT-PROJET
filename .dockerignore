@@ -1,0 +1,26 @@
+# Keep the Docker build context small and free of local secrets.
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.py[cod]
+.venv
+venv
+env
+
+# Local configuration (compose provides the container values)
+.env
+
+# Legacy Raspberry Pi / YOLO material and model weights
+legacy
+*.pt
+*.onnx
+
+# Local PostgreSQL install/data
+pgdata
+pg
+
+# Docs and editor files not needed at runtime
+.vscode
+.idea
+*.log

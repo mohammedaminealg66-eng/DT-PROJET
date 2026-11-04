@@ -1,0 +1,40 @@
+# --- Python -------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# --- Local configuration ------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Local PostgreSQL (portable dev install) ----------------
+pgdata/
+pg/
+.postgres/
+*.log
+
+# --- Models / large binaries --------------------------------
+*.pt
+*.onnx
+*.ncnn_model/
+yolo11n_ncnn_model/
+yolov8n_ncnn_model/
+
+# --- Legacy material kept locally, not published ------------
+legacy/
+
+# --- OS / editors -------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Generated calibration ----------------------------------
+# Keep these if you version your camera calibration, ignore otherwise.
+# pi/seats.json
+# pi/doors.json

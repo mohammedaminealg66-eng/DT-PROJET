@@ -1,0 +1,785 @@
+﻿<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Salle Informatique 3D</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { overflow:hidden; font-family: Arial, sans-serif; background:#000; }
+  #info {
+    position:fixed; top:16px; left:16px; z-index:10;
+    background:rgba(0,0,0,.65); color:#fff; padding:12px 18px;
+    border-radius:10px; font-size:14px; line-height:1.6;
+    backdrop-filter: blur(6px); pointer-events:none;
+  }
+  #info b { color:#b07ce8; }
+  canvas { display:block; }
+  #vignette {
+    position:fixed; inset:0; z-index:5; pointer-events:none;
+    background: radial-gradient(ellipse at center, transparent 58%, rgba(10,6,16,0.38) 100%);
+  }
+</style>
+</head>
+<body>
+<div id="info">
+  <b>Salle Informatique 3D</b><br>
+  Clic gauche + glisser : tourner<br>
+  Molette : zoom<br>
+  Clic droit : déplacer
+</div>
+<div id="vignette"></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ============================================================
+//  SALLE INFORMATIQUE 3D
+//  4 columns x 6 tables (24 PCs) â€” middle 2 columns TOUCHING
+//  Front of class (TV / display) = purple wall (-Z)
+// ============================================================
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x241d2e);
+scene.fog = new THREE.Fog(0x241d2e, 28, 60);
+window.__TW_SCENE = scene;   // handle for digital-twin.js
+
+const camera = new THREE.PerspectiveCamera(58, innerWidth/innerHeight, 0.1, 200);
+camera.position.set(5.5, 5.5, 13.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.3, -2);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.maxPolarAngle = Math.PI/2 - 0.04;
+controls.minDistance = 2;
+controls.maxDistance = 38;
+
+// ============ ROOM DIMENSIONS ============
+const ROOM_W = 13.6;   // X
+const ROOM_D = 19.5;   // Z  (front wall at -Z, door wall at +Z)
+const ROOM_H = 4.4;
+
+// ============ CLASSROOM LAYOUT (single source of truth) ============
+// Shared with digital-twin.js through window.CLASSROOM_CONFIG.
+const COLS = 4, ROWS = 6;
+const colX = [-4.25, -1.025, 1.025, 4.25];  // outer columns shifted 0.30 m; middle pair unchanged (no aisle)
+const rowZ0 = -5.0;
+const spacingZ = 2.55;
+const chairOffsetZ = 0.86;
+
+const CLASSROOM_CONFIG = {
+  room: { w: ROOM_W, d: ROOM_D, h: ROOM_H },
+  layout: { cols: COLS, rows: ROWS, colX: colX, rowZ0: rowZ0, spacingZ: spacingZ, chairOffsetZ: chairOffsetZ },
+  // Door placement is fully configurable:
+  //   wall  : 'left' | 'right' | 'front' | 'back'
+  //   along : coordinate along that wall (z for left/right, x for front/back)
+  //   width : clear opening width in metres
+  // Both doors sit on the FRONT wall (-Z), flanking the TV /
+  // teacher area. Door 1 is ALWAYS the single door, Door 2 the double door.
+  doors: {
+    door1: { name: 'Door 1', kind: 'single', wall: 'front', along: -6.3, width: 0.80, height: 2.20 },
+    door2: { name: 'Door 2', kind: 'double', wall: 'front', along:  5.9, width: 1.60, height: 2.20 }
+  },
+  twin: {
+    walkSpeed: 1.45,                 // metres / second
+    aisleInset: 0.9,                 // side aisle distance from the wall
+    crossAisleOffset: 0.62,          // path z behind the target row's chairs
+    approachOffset: 0.50,            // stop point just behind the chair
+    seatOffsetZ: 0.00,               // final hips offset from the chair centre
+    sitMs: 900, standMs: 700, turnMs: 520,
+    graceMs: 3500,                   // live: empty this long before leaving
+    fallbackDoor: null,              // 'door1' | 'door2' | null = no entry animation
+    assumeNearestDoorWhenUnknown: false
+  }
+};
+window.CLASSROOM_CONFIG = CLASSROOM_CONFIG;
+
+// ============ LIGHTS ============
+scene.add(new THREE.AmbientLight(0xfff2e8, 0.28));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x6a5a7a, 0.32));
+
+function keyLight(x, z, intensity){
+  const l = new THREE.PointLight(0xfff0dc, intensity, 20, 1.8);
+  l.position.set(x, ROOM_H - 0.25, z);
+  l.castShadow = true;
+  l.shadow.mapSize.set(1024, 1024);
+  l.shadow.bias = -0.004;
+  l.shadow.camera.near = 0.3;
+  l.shadow.camera.far = 22;
+  scene.add(l);
+  return l;
+}
+keyLight(-3.4, -4.5, 0.85);
+keyLight(3.4, 4.5, 0.85);
+
+function fillLamp(x, z){
+  const l = new THREE.PointLight(0xfff4e6, 0.6, 16, 1.8);
+  l.position.set(x, ROOM_H - 0.25, z);
+  scene.add(l);
+}
+fillLamp(3.4, -4.5);
+fillLamp(-3.4, 4.5);
+fillLamp(0, 0);
+
+// ============ PROCEDURAL TEXTURES ============
+function makeCanvas(w, h, draw){
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'));
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+// --- Wood (desk top) : light oak with grain
+const woodTex = makeCanvas(512, 256, ctx => {
+  ctx.fillStyle = '#c8a06e';
+  ctx.fillRect(0, 0, 512, 256);
+  for (let i = 0; i < 70; i++){
+    ctx.strokeStyle = `rgba(${110+Math.random()*70|0},${70+Math.random()*40|0},35,${0.08+Math.random()*0.22})`;
+    ctx.lineWidth = 0.7 + Math.random()*2.2;
+    ctx.beginPath();
+    const y = Math.random()*256;
+    ctx.moveTo(0, y);
+    for (let x = 0; x <= 512; x += 64){
+      ctx.lineTo(x, y + Math.sin(x*0.02 + i)*3 + (Math.random()*4-2));
+    }
+    ctx.stroke();
+  }
+  // few knots
+  for (let k = 0; k < 3; k++){
+    const x = Math.random()*512, y = Math.random()*256;
+    const g = ctx.createRadialGradient(x, y, 1, x, y, 14);
+    g.addColorStop(0, 'rgba(90,60,25,0.5)');
+    g.addColorStop(1, 'rgba(90,60,25,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(x-15, y-15, 30, 30);
+  }
+});
+woodTex.repeat.set(1.4, 1);
+
+// --- Tile floor : big light tiles with joints + subtle veins
+const tileTex = makeCanvas(1024, 1024, ctx => {
+  ctx.fillStyle = '#e9e7e3';
+  ctx.fillRect(0, 0, 1024, 1024);
+  // marble veins
+  for (let i = 0; i < 60; i++){
+    ctx.strokeStyle = `rgba(175,172,166,${0.08+Math.random()*0.22})`;
+    ctx.lineWidth = Math.random()*1.6;
+    let x = Math.random()*1024, y = Math.random()*1024;
+    ctx.beginPath(); ctx.moveTo(x, y);
+    for (let s = 0; s < 5; s++){
+      x += Math.random()*90-45; y += Math.random()*90-45;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  // grout lines : 2x2 tiles per texture
+  ctx.strokeStyle = '#c2bfba';
+  ctx.lineWidth = 6;
+  for (let i = 0; i <= 2; i++){
+    ctx.beginPath(); ctx.moveTo(i*512, 0); ctx.lineTo(i*512, 1024); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i*512); ctx.lineTo(1024, i*512); ctx.stroke();
+  }
+});
+tileTex.repeat.set(ROOM_W/3.2, ROOM_D/3.2);
+
+// --- Painted wall texture (very subtle noise)
+function wallTex(base, tint){
+  return makeCanvas(256, 256, ctx => {
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, 256, 256);
+    for (let i = 0; i < 2600; i++){
+      ctx.fillStyle = `rgba(${tint},${0.03+Math.random()*0.05})`;
+      ctx.fillRect(Math.random()*256, Math.random()*256, 1.6, 1.6);
+    }
+  });
+}
+const purpleWallTex = wallTex('#9558b2', '255,255,255');
+purpleWallTex.repeat.set(3, 1);
+
+// --- Environment map (IBL) : soft studio gradient -> real reflections
+function makeEnvMap(){
+  const grad = makeCanvas(64, 256, ctx => {
+    const g = ctx.createLinearGradient(0, 0, 0, 256);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.45, '#cfc9d8');
+    g.addColorStop(0.75, '#8a8494');
+    g.addColorStop(1, '#3d3944');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 64, 256);
+  });
+  const envScene = new THREE.Scene();
+  const box = new THREE.Mesh(
+    new THREE.BoxGeometry(10, 10, 10),
+    new THREE.MeshBasicMaterial({ map: grad, side: THREE.BackSide })
+  );
+  envScene.add(box);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const rt = pmrem.fromScene(envScene, 0.04);
+  pmrem.dispose();
+  return rt.texture;
+}
+scene.environment = makeEnvMap();
+
+// ============ MATERIALS ============
+const deskTopMat = new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.55, metalness: 0.02 });
+const legMat     = new THREE.MeshStandardMaterial({ color: 0x1c1c20, roughness: 0.35, metalness: 0.75 });
+const bodyMat    = new THREE.MeshStandardMaterial({ color: 0x17171a, roughness: 0.55, metalness: 0.15 });
+const blueMat    = new THREE.MeshStandardMaterial({ color: 0x1e4fd6, roughness: 0.8, metalness: 0.0 });
+const blueDark   = new THREE.MeshStandardMaterial({ color: 0x1539a8, roughness: 0.85 });
+
+
+// Dark glossy screen with reflections
+const screenOffTex = makeCanvas(256, 160, ctx => {
+  const g = ctx.createLinearGradient(0, 0, 256, 160);
+  g.addColorStop(0, '#0a0a10');
+  g.addColorStop(0.5, '#101018');
+  g.addColorStop(0.52, '#16161f');
+  g.addColorStop(1, '#08080c');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 256, 160);
+  // diagonal light reflection
+  ctx.fillStyle = 'rgba(255,255,255,0.07)';
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(110, 0); ctx.lineTo(60, 70); ctx.lineTo(0, 90);
+  ctx.closePath(); ctx.fill();
+  // faint horizontal reflection band
+  ctx.fillStyle = 'rgba(255,255,255,0.035)';
+  ctx.fillRect(0, 96, 256, 14);
+  // vignette (edges darker)
+  const v = ctx.createRadialGradient(128, 80, 40, 128, 80, 170);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, 256, 160);
+});
+const screenOffMat = new THREE.MeshStandardMaterial({ map: screenOffTex, roughness: 0.1, metalness: 0.4 });
+
+// Keyboard texture (keycaps grid)
+const kbTex = makeCanvas(512, 170, ctx => {
+  ctx.fillStyle = '#141417';
+  ctx.fillRect(0, 0, 512, 170);
+  const kh = 26, gap = 4, pad = 8;
+  const rows = [14, 14, 13, 12];
+  for (let r = 0; r < 4; r++){
+    let x = pad;
+    for (let k = 0; k < rows[r]; k++){
+      let w = Math.floor((512 - 2*pad - gap*(rows[r]-1)) / rows[r]);
+      ctx.fillStyle = '#2a2a30';
+      ctx.fillRect(x, pad + r*(kh+gap), w, kh);
+      ctx.fillStyle = '#34343b';
+      ctx.fillRect(x + 2, pad + r*(kh+gap) + 2, w - 4, kh - 8);
+      x += w + gap;
+    }
+  }
+  // bottom row : ctrl | win | alt | [space] | alt | fn
+  const y5 = pad + 4*(kh+gap);
+  const widths = [52, 40, 44, 190, 44, 40, 52];
+  let x5 = pad;
+  widths.forEach(w => {
+    ctx.fillStyle = '#2a2a30';
+    ctx.fillRect(x5, y5, w, kh);
+    ctx.fillStyle = '#34343b';
+    ctx.fillRect(x5 + 2, y5 + 2, w - 4, kh - 8);
+    x5 += w + gap;
+  });
+});
+
+// CPU tower front panel (DVD bay, grille, USB, brand strip)
+const cpuFrontTex = makeCanvas(192, 320, ctx => {
+  ctx.fillStyle = '#17171a';
+  ctx.fillRect(0,0,192,320);
+  // optical drive bay
+  ctx.fillStyle = '#0c0c0e';
+  ctx.fillRect(26, 22, 140, 24);
+  ctx.fillStyle = '#2c2c31';
+  ctx.fillRect(26, 28, 140, 3);
+  // brand strip
+  ctx.fillStyle = '#26262b';
+  ctx.fillRect(26, 62, 140, 6);
+  // ventilation grille
+  ctx.fillStyle = '#0b0b0d';
+  for (let y = 110; y < 290; y += 13) ctx.fillRect(30, y, 132, 6);
+  // USB ports
+  ctx.fillStyle = '#0a0a0c';
+  ctx.fillRect(26, 298, 32, 14);
+  ctx.fillRect(66, 298, 32, 14);
+});
+
+// ============ FLOOR / WALLS ============
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(ROOM_W, ROOM_D),
+  new THREE.MeshStandardMaterial({ map: tileTex, roughness: 0.32, metalness: 0.08 })
+);
+floor.rotation.x = -Math.PI/2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+function addWall(w, x, z, ry, tex, color, h = ROOM_H, y = h/2){
+  const m = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshStandardMaterial({ map: tex || null, color: tex ? 0xffffff : color, roughness: 0.92 })
+  );
+  m.position.set(x, y, z);
+  m.rotation.y = ry;
+  m.receiveShadow = true;
+  scene.add(m);
+  return m;
+}
+// FRONT (purple) wall at -Z, built in segments so both doors are real
+// openings in the wall. Door frames: [-6.8,-5.8] and [5.0,6.8], height 2.35.
+// The left, right and back walls are intentionally removed from the scene.
+const FRONT_Z = -ROOM_D/2;
+addWall(10.8, -0.4, FRONT_Z, 0, purpleWallTex);                 // between the two openings
+addWall(1.0, -6.3, FRONT_Z, 0, purpleWallTex, null, 2.05, 2.35 + 2.05/2); // header over Door 1
+addWall(1.8,  5.9, FRONT_Z, 0, purpleWallTex, null, 2.05, 2.35 + 2.05/2); // header over Door 2
+
+// Baseboards (plinthes) dark strip at wall bottom
+function baseboard(w, x, z, ry){
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(w, 0.14, 0.04),
+    new THREE.MeshStandardMaterial({ color: 0x3a3a3e, roughness: 0.6 })
+  );
+  m.position.set(x, 0.07, z);
+  m.rotation.y = ry;
+  scene.add(m);
+}
+baseboard(10.8, -0.4, -ROOM_D/2 + 0.03, 0);   // only the front wall between doors
+
+// ============ DIGITAL BOARD / TV (only display kept on the front wall) ============
+const tvGroup = new THREE.Group();
+const tvFrame = new THREE.Mesh(
+  new THREE.BoxGeometry(3.1, 1.9, 0.1),
+  new THREE.MeshStandardMaterial({ color: 0x151517, roughness: 0.35, metalness: 0.3 })
+);
+tvGroup.add(tvFrame);
+const tvTex = makeCanvas(512, 320, ctx => {
+  ctx.fillStyle = '#07070f';
+  ctx.fillRect(0,0,512,320);
+  ctx.fillStyle = '#3d8bff';
+  ctx.font = 'bold 40px monospace';
+  ctx.fillText('</>', 210, 150);
+  ctx.font = '24px monospace';
+  ctx.fillStyle = '#7fb3ff';
+  ctx.fillText('Coding Lab', 195, 195);
+  ctx.strokeStyle = 'rgba(80,140,255,0.25)';
+  ctx.strokeRect(14, 14, 484, 292);
+});
+const tvScreen = new THREE.Mesh(
+  new THREE.PlaneGeometry(2.9, 1.72),
+  new THREE.MeshStandardMaterial({ map: tvTex, emissive: 0x3388ff, emissiveIntensity: 0.12, roughness: 0.15 })
+);
+tvScreen.position.z = 0.055;
+tvGroup.add(tvScreen);
+tvGroup.position.set(0.0, 2.85, -ROOM_D/2 + 0.07);
+scene.add(tvGroup);
+
+// ============ DOORS (config-driven, see CLASSROOM_CONFIG.doors) ============
+// Door 1 = single leaf, Door 2 = double leaf. Both are integrated into the
+// front (-Z) wall openings, one on each side of the teacher / display area.
+function doorLeaf(w, h){
+  const g = new THREE.Group();
+  const doorMat = new THREE.MeshStandardMaterial({ color: 0x7a5230, roughness: 0.6 });
+  const leaf = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.06), doorMat);
+  leaf.position.y = h/2;
+  leaf.castShadow = true;
+  g.add(leaf);
+  // small window in the door leaf
+  const win = new THREE.Mesh(
+    new THREE.PlaneGeometry(w*0.35, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0x9fb8c8, roughness: 0.15, metalness: 0.4, transparent: true, opacity: 0.5 })
+  );
+  win.position.set(0, h*0.72, 0.035);
+  g.add(win);
+  return g;
+}
+function buildDoorUnit(totalW, totalH){
+  const g = new THREE.Group();
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0xd9d6d0, roughness: 0.6 });
+  const frameH = totalH + 0.15;
+  const jambW = 0.1;
+  // Hollow frame : two jambs + header, so the opening is real and the
+  // door leaves are visible instead of a solid backing slab.
+  [-1, 1].forEach(side => {
+    const jamb = new THREE.Mesh(new THREE.BoxGeometry(jambW, frameH, 0.12), frameMat);
+    jamb.position.set(side * (totalW/2 + jambW/2), frameH/2, 0);
+    g.add(jamb);
+  });
+  const header = new THREE.Mesh(new THREE.BoxGeometry(totalW + 0.2, 0.15, 0.12), frameMat);
+  header.position.set(0, totalH + 0.075, 0);
+  g.add(header);
+  const isDouble = totalW > 1.0;
+  if (isDouble){
+    const leafW = (totalW - 0.04) / 2;
+    const l1 = doorLeaf(leafW, totalH); l1.position.x = -(leafW/2 + 0.02); g.add(l1);
+    const l2 = doorLeaf(leafW, totalH); l2.position.x =  (leafW/2 + 0.02); g.add(l2);
+    const handleMat = new THREE.MeshStandardMaterial({ color: 0xb8b8b8, metalness: 0.85, roughness: 0.3 });
+    [-1, 1].forEach(side => {
+      const h = new THREE.Mesh(new THREE.SphereGeometry(0.04, 12, 10), handleMat);
+      h.position.set(side * 0.08, 1.05, 0.09);
+      g.add(h);
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.28, 0.03), handleMat);
+      bar.position.set(side * 0.08, 1.05, 0.1);
+      g.add(bar);
+    });
+  } else {
+    const leaf = doorLeaf(totalW, totalH);
+    g.add(leaf);
+    const handleMat = new THREE.MeshStandardMaterial({ color: 0xb8b8b8, metalness: 0.85, roughness: 0.3 });
+    const h = new THREE.Mesh(new THREE.SphereGeometry(0.04, 12, 10), handleMat);
+    h.position.set(totalW/2 - 0.1, 1.05, 0.09);
+    g.add(h);
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.28, 0.03), handleMat);
+    bar.position.set(totalW/2 - 0.1, 1.05, 0.1);
+    g.add(bar);
+  }
+  return g;
+}
+
+// Resolve a door config into world position, rotation and in/out vectors.
+function doorFrame(cfg){
+  const halfW = ROOM_W/2, halfD = ROOM_D/2;
+  let x, z, ry, outward;
+  switch (cfg.wall){
+    case 'left':  x = -halfW + 0.07; z = cfg.along; ry =  Math.PI/2; outward = { x:-1, z: 0 }; break;
+    case 'right': x =  halfW - 0.07; z = cfg.along; ry = -Math.PI/2; outward = { x: 1, z: 0 }; break;
+    case 'front': x = cfg.along; z = -halfD + 0.07; ry = 0;           outward = { x: 0, z:-1 }; break;
+    case 'back':  x = cfg.along; z =  halfD - 0.07; ry = Math.PI;     outward = { x: 0, z: 1 }; break;
+    default:      x = -halfW + 0.07; z = cfg.along; ry = Math.PI/2;   outward = { x:-1, z: 0 };
+  }
+  return { x, z, ry, outward, inward: { x: -outward.x, z: -outward.z } };
+}
+
+Object.keys(CLASSROOM_CONFIG.doors).forEach(key => {
+  const cfg = CLASSROOM_CONFIG.doors[key];
+  const f = doorFrame(cfg);
+  const unit = buildDoorUnit(cfg.width, cfg.height);
+  unit.position.set(f.x, 0, f.z);
+  unit.rotation.y = f.ry;
+  scene.add(unit);
+  // Cache geometry used by the walking-avatar path planner.
+  cfg.world   = f;
+  cfg.outside = { x: f.x + f.outward.x * 0.9, z: f.z + f.outward.z * 0.9 };
+  cfg.inside  = { x: f.x + f.inward.x  * 0.75, z: f.z + f.inward.z  * 0.75 };
+  cfg.inward  = f.inward;
+
+  // Dark landing outside the door so the avatar starts on a surface.
+  const landing = new THREE.Mesh(
+    new THREE.BoxGeometry(cfg.width + 0.8, 0.04, 1.7),
+    new THREE.MeshStandardMaterial({ color: 0x2f2a38, roughness: 0.9 })
+  );
+  landing.position.set(f.x + f.outward.x * 0.85, 0.02, f.z + f.outward.z * 0.85);
+  landing.rotation.y = f.ry;
+  landing.receiveShadow = true;
+  scene.add(landing);
+});
+
+(function frontBin(){
+  const g = new THREE.Group();
+  const shellMat = new THREE.MeshStandardMaterial({ color: 0x46545c, roughness: 0.55, metalness: 0.25, side: THREE.DoubleSide });
+  const rimMat = new THREE.MeshStandardMaterial({ color: 0x7b8a92, roughness: 0.35, metalness: 0.45 });
+  const bagMat = new THREE.MeshStandardMaterial({ color: 0x101114, roughness: 0.9, side: THREE.DoubleSide });
+
+  const shell = new THREE.Mesh(new THREE.CylinderGeometry(0.20, 0.17, 0.48, 20, 1, true), shellMat);
+  shell.position.y = 0.24;
+  shell.castShadow = shell.receiveShadow = true;
+  g.add(shell);
+
+  const bottom = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.02, 20), shellMat);
+  bottom.position.y = 0.01;
+  g.add(bottom);
+
+  const bag = new THREE.Mesh(new THREE.CylinderGeometry(0.182, 0.152, 0.44, 20, 1, true), bagMat);
+  bag.position.y = 0.235;
+  g.add(bag);
+
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.198, 0.013, 8, 24), rimMat);
+  rim.rotation.x = Math.PI / 2;
+  rim.position.y = 0.482;
+  rim.castShadow = true;
+  g.add(rim);
+
+  g.name = 'garbageBin';
+  g.position.set(4.55, 0, -8.95);
+  scene.add(g);
+})();
+
+// ============ DESK + PC + CHAIR ============
+const legGeoDesk = new THREE.BoxGeometry(0.055, 0.76, 0.055);
+const apronGeoX  = new THREE.BoxGeometry(1.9, 0.05, 0.035);
+const apronGeoZ  = new THREE.BoxGeometry(0.035, 0.05, 0.9);
+
+function desk(x, z){
+  const g = new THREE.Group();
+
+  // top
+  const top = new THREE.Mesh(new THREE.BoxGeometry(2.05, 0.065, 1.0), deskTopMat);
+  top.position.y = 0.755;
+  top.castShadow = top.receiveShadow = true;
+  g.add(top);
+
+  // 4 legs
+  [[-0.96, -0.44],[0.96, -0.44],[-0.96, 0.44],[0.96, 0.44]].forEach(([lx, lz]) => {
+    const leg = new THREE.Mesh(legGeoDesk, legMat);
+    leg.position.set(lx, 0.37, lz);
+    leg.castShadow = true;
+    g.add(leg);
+  });
+  // aprons under top (rigidity, realism)
+  [[-0.44, apronGeoX, 0], [0.44, apronGeoX, 0]].forEach(([lz, geo]) => {
+    const a = new THREE.Mesh(geo, legMat);
+    a.position.set(0, 0.71, lz);
+    g.add(a);
+  });
+  [[-0.96, apronGeoZ], [0.96, apronGeoZ]].forEach(([lx, geo]) => {
+    const a = new THREE.Mesh(geo, legMat);
+    a.position.set(lx, 0.71, 0);
+    g.add(a);
+  });
+
+  // CPU cabinet under the desk (dark, like photos)
+  const cpu = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.48, 0.8), bodyMat);
+  cpu.position.set(0.5, 0.48, 0.02);
+  cpu.castShadow = true;
+  g.add(cpu);
+  // CPU front panel (DVD bay, grille, USB ports)
+  const cpuFront = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.46, 0.44),
+    new THREE.MeshStandardMaterial({ map: cpuFrontTex, roughness: 0.55 })
+  );
+  cpuFront.position.set(0.5, 0.48, 0.422);
+  g.add(cpuFront);
+  // cpu details : power button
+  const pwr = new THREE.Mesh(
+    new THREE.CircleGeometry(0.02, 12),
+    new THREE.MeshStandardMaterial({ color: 0x33cc66, emissive: 0x22aa44, emissiveIntensity: 0.6 })
+  );
+  pwr.position.set(0.5, 0.52, 0.425);
+  g.add(pwr);
+
+  // ===== Monitor (realistic : shell + bezel + glossy panel + LED) =====
+  const mon = new THREE.Group();
+  const screenFrame = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.4, 0.028), bodyMat);
+  mon.add(screenFrame);
+  const bezel = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.58, 0.355),
+    new THREE.MeshStandardMaterial({ color: 0x0e0e11, roughness: 0.45 })
+  );
+  bezel.position.z = 0.015;
+  mon.add(bezel);
+  const scr = new THREE.Mesh(new THREE.PlaneGeometry(0.545, 0.325), screenOffMat);
+  scr.position.z = 0.016;
+  mon.add(scr);
+  // power LED (bottom-right of bezel)
+  const led = new THREE.Mesh(
+    new THREE.CircleGeometry(0.006, 8),
+    new THREE.MeshBasicMaterial({ color: 0x66ff99 })
+  );
+  led.position.set(0.235, -0.17, 0.017);
+  mon.add(led);
+  // stand
+  const neck = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.2, 0.045), bodyMat);
+  neck.position.set(0, -0.28, -0.004);
+  mon.add(neck);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.02, 0.19), bodyMat);
+  base.position.set(0, -0.39, 0);
+  mon.add(base);
+  // cable grip on the back
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.03), bodyMat);
+  grip.position.set(0, -0.13, -0.02);
+  mon.add(grip);
+  mon.position.set(0, 0.785 + 0.41, -0.32);   // near the front edge of the desk
+  // no rotation: screen plane is built facing +Z, which is exactly where the
+  // student (chair at z+0.86, looking -Z) sits, so the display faces the chair
+  mon.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  g.add(mon);
+
+  // ===== Keyboard (with keycaps texture) =====
+  const kb = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.022, 0.145), bodyMat);
+  kb.position.set(0, 0.8, 0.18);
+  kb.castShadow = true;
+  g.add(kb);
+  const kbTop = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.38, 0.127),
+    new THREE.MeshStandardMaterial({ map: kbTex, roughness: 0.65 })
+  );
+  kbTop.rotation.x = -Math.PI/2;
+  kbTop.position.set(0, 0.812, 0.18);
+  g.add(kbTop);
+
+  // Mouse (with scroll wheel)
+  const mouse = new THREE.Mesh(new THREE.SphereGeometry(0.04, 10, 8), bodyMat);
+  mouse.scale.set(0.65, 0.4, 1);
+  mouse.position.set(0.3, 0.8, 0.2);
+  g.add(mouse);
+  const wheel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.012, 0.012, 0.03),
+    new THREE.MeshStandardMaterial({ color: 0x4a4a52, roughness: 0.35 })
+  );
+  wheel.position.set(0.3, 0.817, 0.17);
+  g.add(wheel);
+
+  // ===== Cables : from monitor down behind desk into CPU =====
+  const cableMat = new THREE.MeshStandardMaterial({ color: 0x0d0d0f, roughness: 0.5 });
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0.02, 0.6, -0.3),
+    new THREE.Vector3(0.08, 0.45, -0.42),
+    new THREE.Vector3(0.2, 0.35, -0.3),
+    new THREE.Vector3(0.35, 0.6, -0.05),
+    new THREE.Vector3(0.45, 0.62, 0.0)
+  ]);
+  g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 16, 0.011, 6), cableMat));
+
+  g.position.set(x, 0, z);
+  scene.add(g);
+  return g;
+}
+
+function chair(x, z){
+  const g = new THREE.Group();
+
+  // seat cushion
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.075, 0.44), blueMat);
+  seat.position.y = 0.465;
+  seat.castShadow = true;
+  g.add(seat);
+  // seat shell
+  const shell = new THREE.Mesh(new THREE.BoxGeometry(0.43, 0.045, 0.41), bodyMat);
+  shell.position.y = 0.42;
+  g.add(shell);
+
+  // backrest : blue cushion + black frame
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.43, 0.5, 0.065), blueMat);
+  back.position.set(0, 0.8, -0.215);
+  back.rotation.x = -0.09;
+  back.castShadow = true;
+  g.add(back);
+  const backFrame = new THREE.Mesh(new THREE.BoxGeometry(0.47, 0.54, 0.028), bodyMat);
+  backFrame.position.set(0, 0.8, -0.252);
+  backFrame.rotation.x = -0.09;
+  g.add(backFrame);
+
+  // legs
+  const legGeo = new THREE.BoxGeometry(0.034, 0.43, 0.034);
+  [[-0.185, -0.175],[0.185, -0.175],[-0.185, 0.175],[0.185, 0.175]].forEach(([lx, lz]) => {
+    const leg = new THREE.Mesh(legGeo, legMat);
+    leg.position.set(lx, 0.2, lz);
+    leg.castShadow = true;
+    g.add(leg);
+  });
+
+  g.position.set(x, 0, z);
+  g.rotation.y = Math.PI;      // faces FRONT (-Z) toward the front wall
+  scene.add(g);
+}
+
+// ============ LAYOUT : 4 COLUMNS x 6 TABLES ============
+// Values come from CLASSROOM_CONFIG (top) so the Digital Twin reuses them.
+// Digital-twin seat registry (chair positions, consumed by digital-twin.js)
+const SEAT_DATA = [];
+window.SEAT_DATA = SEAT_DATA;
+
+for (let c = 0; c < COLS; c++){
+  for (let r = 0; r < ROWS; r++){
+    const x = colX[c];
+    const z = rowZ0 + r * spacingZ;
+    desk(x, z);
+    chair(x, z + chairOffsetZ);   // chair behind desk, facing front (-Z)
+    SEAT_DATA.push({ id: 'C' + (c+1) + '-R' + (r+1), x: x, z: z + chairOffsetZ, col: c+1, row: r+1 });
+  }
+}
+
+// ============ TEACHER DESK (front, near purple wall) ============
+(function teacher(){
+  const g = new THREE.Group();
+  const top = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.08, 1.15), deskTopMat);
+  top.position.y = 0.78;
+  top.castShadow = true;
+  g.add(top);
+  [-1.15, 1.15].forEach(sx => {
+    const side = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.78, 1.05), bodyMat);
+    side.position.set(sx, 0.39, 0);
+    g.add(side);
+  });
+  const front = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.5, 0.05), bodyMat);
+  front.position.set(0, 0.42, 0.5);
+  g.add(front);
+  // monitor facing the teacher
+  const mon = new THREE.Mesh(new THREE.BoxGeometry(0.66, 0.42, 0.03), bodyMat);
+  mon.position.set(-0.4, 1.05, -0.3);
+  g.add(mon);
+  const scr = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.6, 0.37),
+    new THREE.MeshStandardMaterial({ color: 0x123a75, emissive: 0x0a2a5e, emissiveIntensity: 0.5, roughness: 0.2 })
+  );
+  scr.position.set(-0.4, 1.05, -0.283);
+  scr.rotation.y = Math.PI;
+  g.add(scr);
+  const kb = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.02, 0.15), bodyMat);
+  kb.position.set(-0.35, 0.83, -0.05);
+  g.add(kb);
+
+  g.position.set(1.8, 0, -ROOM_D/2 + 1.6);
+  g.rotation.y = Math.PI;
+  scene.add(g);
+})();
+
+// ============ DUST PARTICLES (subtle) ============
+let dustPts;
+(function dust(){
+  const count = 260;
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++){
+    pos[i*3]   = (Math.random()-0.5) * ROOM_W;
+    pos[i*3+1] = Math.random() * (ROOM_H - 0.4) + 0.3;
+    pos[i*3+2] = (Math.random()-0.5) * ROOM_D;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.02, transparent: true, opacity: 0.25, depthWrite: false });
+  const pts = new THREE.Points(geo, mat);
+  scene.add(pts);
+  dustPts = pts;
+})();
+
+// ============ ANIMATION ============
+const clockT = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const t = clockT.getElapsedTime();
+  if (dustPts){
+    dustPts.rotation.y = t * 0.008;
+    dustPts.position.y = Math.sin(t * 0.3) * 0.06;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+<!-- Digital Twin : avatars + occupancy + test mode (separate module) -->
+<script src="digital-twin.js?v=5"></script>
+<!-- PostgreSQL / FastAPI integration (LIVE + TEST modes, stats, history) -->
+<script src="backend-client.js?v=5"></script>
+</body>
+</html>
+
+
+
